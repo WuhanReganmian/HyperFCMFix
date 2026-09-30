@@ -155,7 +155,7 @@ class ModernHook : XposedModule() {
                         if (!fcm) {
                             chain.proceed()
                         } else {
-                            val targetPackage = extractTargetPackage(chain.args)
+                            val targetPackage = extractTargetPackage(chain.args.toTypedArray())
                             val gmsCaller = chain.args.any {
                                 it == GMS_PKG || it?.toString()?.contains(GMS_PKG) == true
                             }
