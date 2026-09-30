@@ -1,56 +1,108 @@
 # HyperFCMFix
 
-针对小米 HyperOS 4 (Android 15) 深度优化的 FCM 推送唤醒与锁屏防冻结 LSPosed 模块（基于现代 LibXposed API 102 架构）。
+针对小米 HyperOS 4 / Android 15 的 FCM 推送唤醒与后台治理修复 LSPosed 模块（LibXposed API 102）。
 
----
+## 本版本改动
 
-## 🌟 核心特性与解决痛点
+### 1. FCM 应用动态识别
 
-在小米 HyperOS 4 下，由于 MIUI / HyperOS 激进的后台治理、Greezer 冻结机制以及 Aurogon 策略，传统的 FCMFix 或常规设置无法保证即时通讯软件（Telegram、Discord、Twitter、Nextcloud Talk 等）在锁屏后及时接收通知。
+模块在 `system_server` 中通过查询：
 
-本模块通过 LSPosed 在 `system_server` 特权层挂载，彻底攻破以下三大拦截层：
+`com.google.android.c2dm.intent.RECEIVE`
 
-1. **突破 Greezer 广播拦截（核心突破）**：
-   - HyperOS 4 在 `BroadcastQueue` 中魔改了 `Greezer Denial: ... need cached broadcast` 机制，非微信/QQ 等国内白名单应用在锁屏冷冻后，FCM 广播会被系统强行暂存，导致 Google Play 服务（GMS）在 1ms 内判定 `No response to broadcast`。
-   - 本模块在开机时**直接反射注入 `GreezeManagerService.mBroadcastTargetWhiteList` 核心白名单表**，将 FCM 广播（`c2dm.intent.RECEIVE` / `REGISTRATION`）与目标应用强行加入豁免名单，使系统将其视同微信/QQ 等对待！
-2. **重写 `appOp == 11` 解决 Stopped 状态拦截**：
-   - 深入拦截 `BroadcastController.broadcastIntentLocked`，当 GMS 派发 FCM 广播时，将默认的 `appOp = -1` 强制重写为系统预留的合法操作码 `11`，并自动注入 `FLAG_RECEIVER_INCLUDE_STOPPED_PACKAGES`，即使应用在多任务中被划掉也能被拉起唤醒。
-3. **解除 GMS 与应用自启动/电量无限制枷锁**：
-   - 拦截 `DeviceIdleController`，强制将 GMS 保持在电池优化白名单中；
-   - 拦截 `AppOpsService` 对 `OP_AUTO_START` (10008) 的权限检查，统一返回 `MODE_ALLOWED`。
-4. **现代 LibXposed API 102 架构**：
-   - 采用现代类型约束与异常沙盒，彻底杜绝传统 Xposed 因类型转换失败拉崩 `system_server` 导致系统进入安全模式（Safe Mode）的问题。
+动态发现已安装的 FCM 接收应用，不再硬编码 Telegram、Nextcloud 等包名。
 
----
+FCM 应用列表会在每次修复周期重新扫描。
 
-## 📲 安装与使用说明
+### 2. AOSP 电池策略自动恢复为「优化」
 
-1. **下载与安装**：
-   - 在 [Releases](https://github.com/Kettycard/HyperFCMFix/releases) 页面下载最新的 Release APK 并安装。
-2. **LSPosed Manager 配置**：
-   - 打开 LSPosed Manager，激活 **HyperOS FCM Fix** 模块；
-   - 作用域仅需勾选：**系统框架 (`android`)** 即可。
-3. **重启手机**：
-   - 重启手机后，模块将在开机 8 秒内自动完成底层白名单注入。
-4. **状态排查与验证**：
-   - 在拨号盘输入 `*#*#426#*#*` 打开 Google Play 服务的 **FCM Diagnostics** 界面；
-   - 观察推送事件，状态应转变为正常的 **`Successful broadcast (time=8~18ms)`**。
+针对动态发现的第三方 FCM 应用：
 
----
+- 系统启动完成后 **5 分钟**执行第一次扫描与修复；
+- 此后 **每 12 小时**重新扫描并校正；
+- 将 FCM 应用从 AOSP `deviceidle` power-save whitelist 中移除，使 AOSP 电池策略回到 **Optimized / 优化**；
+- 不修改 HyperOS 自启动开关；
+- 不把第三方 FCM 应用加入 AOSP 电池无限制白名单；
+- GMS 自身继续保持原有的 FCM 保护。
 
-## 🙏 参考与致谢项目 (Credits & Acknowledgments)
+> 注意：AOSP「优化」与 HyperOS 自启动、Greezer、Aurogon 是不同层级的机制。本模块不会把它们混成一个开关。
 
-本项目在逆向分析小米底层机制与设计穿透方案时，深入参考并借鉴了开源社区以下优秀项目的研究成果与实现，特此致谢：
+### 3. FCM stopped-app 广播穿透
 
-- **[kooritea/fcmfix](https://github.com/kooritea/fcmfix)**：
-  - 启发了关于 Android 广播队列中 `appOp` 参数改写（`-1` -> `11`）以及 `FLAG_RECEIVER_INCLUDE_STOPPED_PACKAGES` 广播标记注入的经典思路。
-- **[dingwen07/hyperos-fcm-fix](https://github.com/dingwen07/hyperos-fcm-fix)**：
-  - 提供了详尽的小米 HyperOS 底层 `GreezeManagerService`、`ActiveStateController` 状态机、`MILLET_NO_RESTRICT_APP` 与 `Aurogon` 拦截机制的技术逆向调查报告。
-- **[libxposed/api](https://github.com/libxposed/api)**：
-  - 提供了下一代现代、类型安全且高稳定性的 Xposed API 102 标准接口支持。
+`BroadcastController.broadcastIntentLocked` / `BroadcastQueueModernImpl.enqueueBroadcastLocked` 仅针对 FCM 广播进行处理：
 
----
+- `com.google.android.c2dm.intent.RECEIVE`
+- `com.google.android.c2dm.intent.REGISTRATION`
 
-## 📄 开源许可证
+对 FCM 广播注入 `FLAG_RECEIVER_INCLUDE_STOPPED_PACKAGES`，并清除 `EXCLUDE_STOPPED_PACKAGES`。
 
-本项目基于 Apache License 2.0 开源。
+同时仅在 FCM 场景下处理原有的 `appOp == -1 -> 11` 兼容逻辑，避免对普通广播产生全局影响。
+
+### 4. HyperOS Greezer FCM 穿透
+
+动态将检测到的 FCM 应用加入 Greezer 的 FCM 广播白名单。
+
+`shouldStopBroadcastDispatch` 只针对能够识别为 GMS/FCM 的广播放行，不再对所有普通广播直接返回 false。
+
+### 5. 不再全局放开第三方 AUTO_START
+
+旧版本会对所有应用的 `OP_AUTO_START (10008)` 返回 `MODE_ALLOWED`。
+
+本版本删除这一全局行为：
+
+- GMS 保留自身自启动保护；
+- 第三方应用不会因为安装本模块而统一获得 HyperOS 自启动权限；
+- FCM 唤醒依赖 system_server 的 FCM 广播穿透。
+
+因此目标是实现：
+
+**HyperOS 自启动关闭 + AOSP 电池策略为「优化」+ App 进程被杀/进入 stopped 状态时，仍允许 GMS 的 FCM 广播唤醒目标 App。**
+
+实际效果需要在具体 HyperOS 版本上用 GMS FCM Diagnostics 和真实推送进行验证。
+
+## 内置状态 / 日志界面
+
+现在模块 APK 自带一个简单的原生 UI：
+
+- 显示当前识别到的 FCM 应用；
+- 显示包名；
+- 显示电池策略修复周期；
+- 显示最近的 system_server 修复日志；
+- 支持刷新；
+- 支持清空日志。
+
+日志包括：
+
+- FCM 应用发现；
+- Battery Optimization 校正；
+- Greezer bypass；
+- FCM stopped-app bypass；
+- 初始化命令；
+- 异常。
+
+## LSPosed 作用域
+
+仍然只需要：
+
+`android`
+
+即 system framework / system_server。
+
+## 验证建议
+
+1. 关闭 Telegram / Discord 等测试应用的 HyperOS 自启动；
+2. 将 AOSP 电池策略手动设置为「不受限制」；
+3. 等待开机 5 分钟后的首次修复，确认恢复为「优化」；
+4. 或手动结束目标 App 进程；
+5. 使用 GMS FCM Diagnostics / 实际推送测试；
+6. 查看模块 UI 中的 FCM 列表与日志；
+7. 重点观察是否仍出现：
+   - `Failed to broadcast to stopped app`
+   - `No response to broadcast`
+   - `Greeze Denial`
+
+## 参考
+
+- kooritea/fcmfix
+- dingwen07/hyperos-fcm-fix
+- libxposed/api
