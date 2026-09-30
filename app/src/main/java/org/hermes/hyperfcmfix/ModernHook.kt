@@ -39,6 +39,10 @@ class ModernHook : XposedModule() {
 
         private const val INITIAL_DELAY_MS = 5 * 60 * 1000L
         private const val REPAIR_PERIOD_MS = 12 * 60 * 60 * 1000L
+        private const val SETTING_FCM_APPS = "hyperfcmfix_fcm_apps"
+        private const val SETTING_LOGS = "hyperfcmfix_logs"
+        private const val ACTION_RETRY_SCAN = "org.hermes.hyperfcmfix.action.RETRY_SCAN"
+        private const val MAX_LOG_LINES = 300
 
         @Volatile private var fcmPackages: Set<String> = emptySet()
         @Volatile private var systemContext: Context? = null
@@ -54,19 +58,17 @@ class ModernHook : XposedModule() {
         private fun logEvent(context: Context?, message: String, level: Int = Log.INFO) {
             Log.println(level, TAG, message)
             try {
-                if (context == null) return
-                val appContext = context.createPackageContext(
-                    MODULE_PKG, Context.CONTEXT_IGNORE_SECURITY
-                )
-                val file = File(appContext.filesDir, "hyperfcmfix.log")
-                file.parentFile?.mkdirs()
-                synchronized(dateFormat) {
-                    file.appendText("${dateFormat.format(Date())} $message\n")
+                val c = context ?: return
+                val line = synchronized(dateFormat) {
+                    "${dateFormat.format(Date())} $message"
                 }
-                if (file.length() > 1024 * 1024) {
-                    val lines = file.readLines()
-                    file.writeText(lines.takeLast(5000).joinToString("\n") + "\n")
-                }
+                val current = Settings.Global.getString(c.contentResolver, SETTING_LOGS).orEmpty()
+                val lines = current.split('\n')
+                    .filter { it.isNotBlank() }
+                    .takeLast(MAX_LOG_LINES - 1)
+                    .toMutableList()
+                lines.add(line)
+                Settings.Global.putString(c.contentResolver, SETTING_LOGS, lines.joinToString("\n"))
             } catch (_: Throwable) {
                 // Logging must never affect system_server.
             }
@@ -155,7 +157,7 @@ class ModernHook : XposedModule() {
                         if (!fcm) {
                             chain.proceed()
                         } else {
-                            val targetPackage = extractTargetPackage(chain.args.toTypedArray())
+                            val targetPackage = extractTargetPackage(chain.args)
                             val gmsCaller = chain.args.any {
                                 it == GMS_PKG || it?.toString()?.contains(GMS_PKG) == true
                             }
@@ -235,6 +237,7 @@ class ModernHook : XposedModule() {
                             )
                             executePrivilegedCommands(context)
                             registerMilletObserver(context.contentResolver)
+                            registerRetryReceiver(context)
                         } catch (e: Throwable) {
                             logEvent(systemContext, "systemReady worker failed: ${e.message}", Log.WARN)
                         }
@@ -245,6 +248,23 @@ class ModernHook : XposedModule() {
             }
         } catch (t: Throwable) {
             log(Log.WARN, TAG, "systemReady hook failed: ${t.message}")
+        }
+    }
+
+    private fun registerRetryReceiver(context: Context) {
+        try {
+            val filter = android.content.IntentFilter(ACTION_RETRY_SCAN)
+            context.registerReceiver(object : android.content.BroadcastReceiver() {
+                override fun onReceive(receiverContext: Context, intent: Intent?) {
+                    if (intent?.action != ACTION_RETRY_SCAN) return
+                    Thread {
+                        runRepair(receiverContext, "manual retry")
+                    }.apply { isDaemon = true; name = "HyperFCMFix-Retry"; start() }
+                }
+            }, filter, Context.RECEIVER_EXPORTED)
+            logEvent(context, "Manual retry receiver registered")
+        } catch (t: Throwable) {
+            logEvent(context, "Manual retry receiver registration failed: ${t.message}", Log.WARN)
         }
     }
 
@@ -314,15 +334,45 @@ class ModernHook : XposedModule() {
     private fun resetFcmBatteryOptimization(context: Context, packages: Set<String>) {
         for (pkg in packages) {
             try {
-                val cmd = "cmd deviceidle whitelist -$pkg"
-                val exit = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd)).waitFor()
-                logEvent(context, "Battery optimization -> Optimized: $pkg exit=$exit")
+                val powerManager = context.getSystemService(android.os.PowerManager::class.java)
+                val before = powerManager?.isIgnoringBatteryOptimizations(pkg) == true
+                val removed = removeFromDeviceIdleWhitelist(pkg)
+                val after = powerManager?.isIgnoringBatteryOptimizations(pkg) == true
+                logEvent(
+                    context,
+                    "Battery repair: $pkg beforeOptimized=${!before} removed=$removed afterOptimized=${!after}"
+                )
             } catch (t: Throwable) {
                 logEvent(context, "Battery reset failed: $pkg ${t.message}", Log.WARN)
             }
         }
     }
 
+    /**
+     * Remove a user-added AOSP Doze whitelist entry through the real
+     * DeviceIdleController Binder API. This is preferable to spawning
+     * `cmd deviceidle` from system_server and also persists the change.
+     */
+    private fun removeFromDeviceIdleWhitelist(packageName: String): Boolean {
+        return try {
+            val serviceManager = Class.forName("android.os.ServiceManager")
+            val getService = serviceManager.getMethod("getService", String::class.java)
+            val binder = getService.invoke(null, "deviceidle") ?: return false
+            val stub = Class.forName("android.os.IDeviceIdleController\$Stub")
+            val asInterface = stub.getMethod("asInterface", android.os.IBinder::class.java)
+            val service = asInterface.invoke(null, binder) ?: return false
+            val method = service.javaClass.methods.firstOrNull {
+                it.name == "removePowerSaveWhitelistApp" && it.parameterTypes.size == 1
+            } ?: stub.methods.firstOrNull {
+                it.name == "removePowerSaveWhitelistApp" && it.parameterTypes.size == 1
+            } ?: return false
+            method.isAccessible = true
+            method.invoke(service, packageName)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
     private fun injectGreezerWhiteList(context: Context, packages: Set<String>) {
         try {
             val clazz = systemServerClassLoader?.loadClass("com.miui.server.greeze.GreezeManagerService") ?: return
@@ -398,8 +448,13 @@ class ModernHook : XposedModule() {
 
     private fun saveFcmPackages(context: Context, packages: Set<String>) {
         try {
-            val appContext = context.createPackageContext(MODULE_PKG, Context.CONTEXT_IGNORE_SECURITY)
-            File(appContext.filesDir, "fcm_apps.txt").writeText(packages.sorted().joinToString("\n"))
-        } catch (_: Throwable) {}
+            Settings.Global.putString(
+                context.contentResolver,
+                SETTING_FCM_APPS,
+                packages.sorted().joinToString("\n")
+            )
+        } catch (t: Throwable) {
+            logEvent(context, "Saving FCM app list failed: ${t.message}", Log.WARN)
+        }
     }
 }
