@@ -1,11 +1,12 @@
 package org.hermes.hyperfcmfix
 
+import android.Manifest
 import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.database.ContentObserver
 import android.net.Uri
-import android.os.Binder
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
@@ -14,81 +15,110 @@ import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedModule
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class ModernHook : XposedModule() {
-
     companion object {
         private const val TAG = "HyperFCMFix"
         private const val GMS_PKG = "com.google.android.gms"
+        private const val MODULE_PKG = "org.hermes.hyperfcmfix"
         private const val SETTING_MILLET = "MILLET_NO_RESTRICT_APP"
         private const val OP_AUTO_START = 10008
+        private const val OP_FCM_BROADCAST = 11
         private const val MODE_ALLOWED = 0
 
+        private const val FCM_RECEIVE = "com.google.android.c2dm.intent.RECEIVE"
+        private const val FCM_REGISTRATION = "com.google.android.c2dm.intent.REGISTRATION"
         private const val FLAG_RECEIVER_INCLUDE_STOPPED_PACKAGES = 0x00000020
         private const val FLAG_RECEIVER_EXCLUDE_STOPPED_PACKAGES = 0x00000010
+
+        private const val INITIAL_DELAY_MS = 5 * 60 * 1000L
+        private const val REPAIR_PERIOD_MS = 12 * 60 * 60 * 1000L
+
+        @Volatile private var fcmPackages: Set<String> = emptySet()
+        @Volatile private var systemContext: Context? = null
+        @Volatile private var systemServerClassLoader: ClassLoader? = null
+        private val scheduler = Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "HyperFCMFix-Repair").apply { isDaemon = true }
+        }
+        private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+
+        private fun isFcmAction(action: String?) =
+            action == FCM_RECEIVE || action == FCM_REGISTRATION
+
+        private fun logEvent(context: Context?, message: String, level: Int = Log.INFO) {
+            Log.println(level, TAG, message)
+            try {
+                if (context == null) return
+                val appContext = context.createPackageContext(
+                    MODULE_PKG, Context.CONTEXT_IGNORE_SECURITY
+                )
+                val file = File(appContext.filesDir, "hyperfcmfix.log")
+                file.parentFile?.mkdirs()
+                synchronized(dateFormat) {
+                    file.appendText("${dateFormat.format(Date())} $message\n")
+                }
+                if (file.length() > 1024 * 1024) {
+                    val lines = file.readLines()
+                    file.writeText(lines.takeLast(5000).joinToString("\n") + "\n")
+                }
+            } catch (_: Throwable) {
+                // Logging must never affect system_server.
+            }
+        }
     }
 
     override fun onSystemServerStarting(param: SystemServerStartingParam) {
         val classLoader = param.classLoader
-        log(Log.INFO, TAG, "system_server 正在启动，载入 LibXposed API 102 现代架构...")
-
+        systemServerClassLoader = classLoader
+        log(Log.INFO, TAG, "HyperFCMFix starting")
         hookDeviceIdleController(classLoader)
         hookAppOpsService(classLoader)
         hookBroadcastQueue(classLoader)
         hookXiaomiBroadcastStub(classLoader)
-        injectGreezerWhiteList(classLoader)
         hookSystemReady(classLoader)
     }
 
-    override fun onPackageLoaded(param: PackageLoadedParam) {
-    }
+    override fun onPackageLoaded(param: PackageLoadedParam) = Unit
 
-    /**
-     * 1. 拦截 DeviceIdleController，强制 GMS 进入电池优化白名单
-     */
     private fun hookDeviceIdleController(classLoader: ClassLoader) {
         try {
             val clazz = classLoader.loadClass("com.android.server.DeviceIdleController")
             for (m in clazz.declaredMethods) {
                 if (m.returnType == Boolean::class.javaPrimitiveType &&
-                    (m.name == "isPowerSaveWhitelistApp" || m.name == "isPowerSaveWhitelistExceptIdleApp")
-                ) {
+                    (m.name == "isPowerSaveWhitelistApp" ||
+                     m.name == "isPowerSaveWhitelistExceptIdleApp")) {
                     hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept { chain ->
-                        val arg0 = chain.args.firstOrNull() as? String
-                        if (arg0 == GMS_PKG) {
-                            true
-                        } else {
-                            chain.proceed()
-                        }
+                        val pkg = chain.args.firstOrNull() as? String
+                        if (pkg == GMS_PKG) true else chain.proceed()
                     }
-                    log(Log.INFO, TAG, "已安全 Hook DeviceIdleController.${m.name}")
                 }
             }
+            log(Log.INFO, TAG, "DeviceIdleController GMS protection enabled")
         } catch (t: Throwable) {
-            log(Log.WARN, TAG, "Hook DeviceIdleController 失败: ${t.message}")
+            log(Log.WARN, TAG, "DeviceIdleController hook failed: ${t.message}")
         }
     }
 
     /**
-     * 2. 拦截 AppOpsService，解除 GMS 及所有被 GMS 唤醒应用的自启动限制
+     * Only GMS keeps its own autostart permission. We do NOT globally allow
+     * OP_AUTO_START for every application anymore.
      */
     private fun hookAppOpsService(classLoader: ClassLoader) {
         try {
             val clazz = classLoader.loadClass("com.android.server.appop.AppOpsService")
             for (m in clazz.declaredMethods) {
                 if (m.returnType == Int::class.javaPrimitiveType &&
-                    (m.name == "checkOperation" || m.name == "noteOperation")
-                ) {
+                    (m.name == "checkOperation" || m.name == "noteOperation")) {
                     hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept { chain ->
-                        val args = chain.args
-                        val code = args.getOrNull(0) as? Int
-                        val pkgName = args.getOrNull(2) as? String
-
-                        // 放行 GMS 自身的自启动
-                        if (pkgName == GMS_PKG && (code == OP_AUTO_START || code == 11)) {
-                            MODE_ALLOWED
-                        } else if (code == OP_AUTO_START) {
-                            // 当检查其他应用（如 Telegram）的自启动时，放行自启动
+                        val code = chain.args.getOrNull(0) as? Int
+                        val pkg = chain.args.getOrNull(2) as? String
+                        if (pkg == GMS_PKG && (code == OP_AUTO_START || code == OP_FCM_BROADCAST)) {
                             MODE_ALLOWED
                         } else {
                             chain.proceed()
@@ -96,178 +126,221 @@ class ModernHook : XposedModule() {
                     }
                 }
             }
-            log(Log.INFO, TAG, "已安全 Hook AppOpsService 自启动放行逻辑")
+            log(Log.INFO, TAG, "AppOps restricted to GMS; no global AUTO_START bypass")
         } catch (t: Throwable) {
-            log(Log.WARN, TAG, "Hook AppOpsService 失败: ${t.message}")
+            log(Log.WARN, TAG, "AppOpsService hook failed: ${t.message}")
         }
     }
 
     /**
-     * 3. 拦截 BroadcastQueue / BroadcastController，解除 Stopped 应用拦截
+     * FCM-only stopped-app bypass. The target package must be in the
+     * dynamically discovered FCM package set.
      */
     private fun hookBroadcastQueue(classLoader: ClassLoader) {
         val targets = listOf(
             "com.android.server.am.BroadcastQueueModernImpl" to "enqueueBroadcastLocked",
             "com.android.server.am.BroadcastController" to "broadcastIntentLocked"
         )
-
         for ((className, methodName) in targets) {
             try {
                 val clazz = classLoader.loadClass(className)
                 for (m in clazz.declaredMethods) {
-                    if (m.name == methodName) {
-                        hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept { chain ->
-                            var isFcm = false
-                            for (arg in chain.args) {
-                                if (arg is Intent) {
-                                    val action = arg.action
-                                    if (action == "com.google.android.c2dm.intent.RECEIVE" ||
-                                        action == "com.google.android.c2dm.intent.REGISTRATION"
-                                    ) {
-                                        isFcm = true
-                                        var flags = arg.flags
-                                        flags = flags or FLAG_RECEIVER_INCLUDE_STOPPED_PACKAGES
-                                        flags = flags and FLAG_RECEIVER_EXCLUDE_STOPPED_PACKAGES.inv()
-                                        arg.flags = flags
-                                        log(Log.INFO, TAG, "已为 FCM 广播注入穿透标记: $action")
-                                    }
+                    if (m.name != methodName) continue
+                    hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept { chain ->
+                        var intent: Intent? = null
+                        for (arg in chain.args) {
+                            if (arg is Intent) { intent = arg; break }
+                        }
+                        val fcm = intent != null && isFcmAction(intent!!.action)
+                        if (!fcm) {
+                            chain.proceed()
+                        } else {
+                            val targetPackage = extractTargetPackage(chain.args)
+                            val gmsCaller = chain.args.any {
+                                it == GMS_PKG || it?.toString()?.contains(GMS_PKG) == true
+                            }
+                            val isTargetFcm = (targetPackage != null && fcmPackages.contains(targetPackage)) ||
+                                targetPackage == GMS_PKG || gmsCaller
+
+                            if (isTargetFcm) {
+                            intent!!.flags = (intent!!.flags or FLAG_RECEIVER_INCLUDE_STOPPED_PACKAGES) and
+                                FLAG_RECEIVER_EXCLUDE_STOPPED_PACKAGES.inv()
+                            for (i in chain.args.indices) {
+                                if (chain.args[i] is Int && chain.args[i] == -1) {
+                                    chain.args[i] = OP_FCM_BROADCAST
                                     break
                                 }
                             }
-                            if (isFcm) {
-                                // 核心黑科技：当 appOp 为 -1 时，改写为 11 (OP_VIBRATE / 系统放行操作码)
-                                for (i in chain.args.indices) {
-                                    val v = chain.args[i]
-                                    if (v is Int && v == -1) {
-                                        chain.args[i] = 11
-                                        log(Log.INFO, TAG, "改写 FCM broadcastIntentLocked appOp: -1 -> 11")
-                                    }
-                                }
+                                logEvent(systemContext, "FCM broadcast bypass: action=${intent!!.action} target=${targetPackage ?: "unknown"}")
                             }
                             chain.proceed()
                         }
-                        log(Log.INFO, TAG, "已安全 Hook $className.$methodName 广播穿透与 appOp 改写")
                     }
                 }
-            } catch (ignored: Throwable) {
+                log(Log.INFO, TAG, "Hooked $className.$methodName")
+            } catch (t: Throwable) {
+                log(Log.WARN, TAG, "Hook $className.$methodName failed: ${t.message}")
             }
         }
     }
 
     /**
-     * 4. 关键：拦截小米 BroadcastQueueModernStubImpl.shouldStopBroadcastDispatch
-     * 彻底阻止小米框架在派发广播时掐断 FCM 消息！
+     * Xiaomi's dispatch stop check is bypassed only when the invocation is
+     * clearly associated with GMS/FCM or a known FCM package.
      */
     private fun hookXiaomiBroadcastStub(classLoader: ClassLoader) {
         try {
-            val stubClass = classLoader.loadClass("com.android.server.am.BroadcastQueueModernStubImpl")
-            for (m in stubClass.declaredMethods) {
-                if (m.name == "shouldStopBroadcastDispatch" && m.returnType == Boolean::class.javaPrimitiveType) {
-                    hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept { chain ->
-                        // 检查参数中是否包含 FCM 广播或者直接拦截
-                        var isFcm = false
-                        for (arg in chain.args) {
-                            if (arg != null) {
-                                val str = arg.toString()
-                                if (str.contains("c2dm.intent.RECEIVE") ||
-                                    str.contains("c2dm.intent.REGISTRATION") ||
-                                    str.contains("com.google.android.gms")
-                                ) {
-                                    isFcm = true
-                                    break
-                                }
-                            }
-                        }
-                        if (isFcm) {
-                            log(Log.INFO, TAG, "阻止小米拦截 FCM 广播分发 -> 放行!")
-                            false // 绝不停止分发！
-                        } else {
-                            chain.proceed()
-                        }
-                    }
-                    log(Log.INFO, TAG, "成功 Hook BroadcastQueueModernStubImpl.shouldStopBroadcastDispatch")
+            val clazz = classLoader.loadClass("com.android.server.am.BroadcastQueueModernStubImpl")
+            for (m in clazz.declaredMethods) {
+                if (m.name != "shouldStopBroadcastDispatch" ||
+                    m.returnType != Boolean::class.javaPrimitiveType) continue
+                hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept { chain ->
+                    val text = chain.args.joinToString(" ") { it?.toString() ?: "" }
+                    val isFcm = text.contains(FCM_RECEIVE) ||
+                        text.contains(FCM_REGISTRATION) ||
+                        text.contains(GMS_PKG) ||
+                        fcmPackages.any { pkg -> text.contains(pkg) }
+                    if (isFcm) {
+                        logEvent(systemContext, "Greezer dispatch bypass: $text")
+                        false
+                    } else chain.proceed()
                 }
+                log(Log.INFO, TAG, "Hooked Xiaomi shouldStopBroadcastDispatch")
             }
         } catch (t: Throwable) {
-            log(Log.WARN, TAG, "未找到 BroadcastQueueModernStubImpl: ${t.message}")
+            log(Log.WARN, TAG, "Xiaomi BroadcastQueue hook unavailable: ${t.message}")
         }
     }
 
-    /**
-     * 5. 系统启动后执行特权命令，并监听/保持 MILLET_NO_RESTRICT_APP 白名单
-     */
     private fun hookSystemReady(classLoader: ClassLoader) {
         try {
             val amsClass = classLoader.loadClass("com.android.server.am.ActivityManagerService")
             for (m in amsClass.declaredMethods) {
-                if (m.name == "systemReady") {
-                    hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept { chain ->
-                        val res = chain.proceed()
-                        val amsInstance = chain.thisObject
-                        Thread {
-                            try {
-                                Thread.sleep(6000)
-                                executePrivilegedCommands()
-                                registerMilletObserver(amsInstance)
-                            } catch (e: Throwable) {
-                                log(Log.WARN, TAG, "后台特权执行线程异常: ${e.message}")
-                            }
-                        }.apply {
-                            name = "HyperFCMFix-Init"
-                            isDaemon = true
-                            start()
+                if (m.name != "systemReady") continue
+                hook(m).setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE).intercept { chain ->
+                    val result = chain.proceed()
+                    val ams = chain.thisObject
+                    Thread {
+                        try {
+                            val field = ams.javaClass.getDeclaredField("mContext")
+                            field.isAccessible = true
+                            val context = field.get(ams) as? Context ?: return@Thread
+                            systemContext = context
+                            logEvent(context, "systemReady: scheduling FCM scan/repair in 5 minutes")
+                            scheduler.scheduleAtFixedRate(
+                                { runRepair(context, "boot+5m / every+12h") },
+                                INITIAL_DELAY_MS,
+                                REPAIR_PERIOD_MS,
+                                TimeUnit.MILLISECONDS
+                            )
+                            executePrivilegedCommands(context)
+                            registerMilletObserver(context.contentResolver)
+                        } catch (e: Throwable) {
+                            logEvent(systemContext, "systemReady worker failed: ${e.message}", Log.WARN)
                         }
-                        res
-                    }
-                    log(Log.INFO, TAG, "已安全 Hook ActivityManagerService.systemReady")
-                    break
+                    }.apply { isDaemon = true; name = "HyperFCMFix-Init"; start() }
+                    result
+                }
+                break
+            }
+        } catch (t: Throwable) {
+            log(Log.WARN, TAG, "systemReady hook failed: ${t.message}")
+        }
+    }
+
+    private fun runRepair(context: Context, reason: String) {
+        try {
+            val packages = discoverFcmPackages(context)
+            fcmPackages = packages
+            saveFcmPackages(context, packages)
+            injectGreezerWhiteList(context, packages)
+            resetFcmBatteryOptimization(context, packages)
+            ensureGmsInMillet(context.contentResolver)
+            logEvent(context, "Repair complete: reason=$reason fcmApps=${packages.size}")
+        } catch (t: Throwable) {
+            logEvent(context, "Repair failed: ${t.message}", Log.WARN)
+        }
+    }
+
+    /**
+     * Finds applications declaring the classic FCM c2dm receiver.
+     * GMS itself is intentionally excluded from the FCM-app battery reset.
+     */
+    private fun discoverFcmPackages(context: Context): Set<String> {
+        val pm = context.packageManager
+        val result = linkedSetOf<String>()
+        val intent = Intent(FCM_RECEIVE)
+        val flags = PackageManager.MATCH_DIRECT_BOOT_AWARE or
+            PackageManager.MATCH_DIRECT_BOOT_UNAWARE
+        try {
+            pm.queryBroadcastReceivers(intent, flags).forEach {
+                val pkg = it.activityInfo?.packageName
+                if (!pkg.isNullOrBlank() && pkg != GMS_PKG && pkg != MODULE_PKG &&
+                    hasNotificationPermission(pm, pkg)) {
+                    result.add(pkg)
                 }
             }
         } catch (t: Throwable) {
-            log(Log.WARN, TAG, "Hook systemReady 失败: ${t.message}")
+            logEvent(context, "FCM receiver discovery failed: ${t.message}", Log.WARN)
+        }
+        return result
+    }
+
+    /**
+     * Only applications that currently have the Android notification runtime
+     * permission are treated as FCM apps. Declaring POST_NOTIFICATIONS in the
+     * manifest is not enough: the user must have granted it.
+     *
+     * On Android versions before 13 the permission is a normal/install-time
+     * permission, so checkPermission() remains the appropriate compatibility
+     * check.
+     */
+    private fun hasNotificationPermission(pm: PackageManager, packageName: String): Boolean {
+        return try {
+            pm.checkPermission(Manifest.permission.POST_NOTIFICATIONS, packageName) ==
+                PackageManager.PERMISSION_GRANTED
+        } catch (t: Throwable) {
+            logEvent(systemContext, "Notification permission check failed: $packageName ${t.message}", Log.WARN)
+            false
         }
     }
 
-    private fun registerMilletObserver(amsInstance: Any?) {
-        try {
-            if (amsInstance == null) return
-            val contextField = amsInstance.javaClass.getDeclaredField("mContext")
-            contextField.isAccessible = true
-            val context = contextField.get(amsInstance) as? Context ?: return
-            val resolver = context.contentResolver
-
-            ensureGmsInMillet(resolver)
-
-            val uri = Settings.System.getUriFor(SETTING_MILLET)
-            val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
-                override fun onChange(selfChange: Boolean, uri: Uri?) {
-                    super.onChange(selfChange, uri)
-                    ensureGmsInMillet(resolver)
-                }
+    /**
+     * "Optimized" in AOSP terms means the app is NOT on the deviceidle
+     * power-save whitelist. We remove FCM apps from that whitelist.
+     *
+     * This deliberately does not touch HyperOS Autostart.
+     */
+    private fun resetFcmBatteryOptimization(context: Context, packages: Set<String>) {
+        for (pkg in packages) {
+            try {
+                val cmd = "cmd deviceidle whitelist -$pkg"
+                val exit = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd)).waitFor()
+                logEvent(context, "Battery optimization -> Optimized: $pkg exit=$exit")
+            } catch (t: Throwable) {
+                logEvent(context, "Battery reset failed: $pkg ${t.message}", Log.WARN)
             }
-            resolver.registerContentObserver(uri, false, observer)
-            log(Log.INFO, TAG, "成功注册 MILLET_NO_RESTRICT_APP 动态保活监听器")
-        } catch (e: Throwable) {
-            log(Log.WARN, TAG, "注册 MILLET 监听器失败: ${e.message}")
         }
     }
 
-    private fun ensureGmsInMillet(resolver: ContentResolver) {
+    private fun injectGreezerWhiteList(context: Context, packages: Set<String>) {
         try {
-            val current = Settings.System.getString(resolver, SETTING_MILLET) ?: ""
-            val list = current.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
-            if (!list.contains(GMS_PKG)) {
-                list.add(GMS_PKG)
-                val updated = list.joinToString(",")
-                Settings.System.putString(resolver, SETTING_MILLET, updated)
-                log(Log.INFO, TAG, "MILLET_NO_RESTRICT_APP 自动补齐 GMS -> $updated")
+            val clazz = systemServerClassLoader?.loadClass("com.miui.server.greeze.GreezeManagerService") ?: return
+            for (field in clazz.declaredFields) {
+                if (field.name != "mBroadcastTargetWhiteList") continue
+                field.isAccessible = true
+                val map = field.get(null) as? MutableMap<Any?, Any?> ?: continue
+                val actions = mutableListOf(FCM_RECEIVE, FCM_REGISTRATION)
+                for (pkg in packages) map[pkg] = actions
+                map[GMS_PKG] = actions
+                logEvent(context, "Greezer FCM whitelist refreshed: ${packages.size} apps")
             }
-        } catch (e: Throwable) {
-            log(Log.WARN, TAG, "ensureGmsInMillet 异常: ${e.message}")
+        } catch (t: Throwable) {
+            logEvent(context, "Greezer whitelist refresh failed: ${t.message}", Log.WARN)
         }
     }
 
-    private fun executePrivilegedCommands() {
+    private fun executePrivilegedCommands(context: Context) {
         val commands = listOf(
             "cmd deviceidle whitelist +$GMS_PKG",
             "cmd appops set $GMS_PKG AUTO_START allow",
@@ -277,42 +350,56 @@ class ModernHook : XposedModule() {
         )
         for (cmd in commands) {
             try {
-                val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
-                val exitCode = process.waitFor()
-                log(Log.INFO, TAG, "自动执行指令: [$cmd], 状态码: $exitCode")
-            } catch (e: Throwable) {
-                log(Log.WARN, TAG, "执行指令失败: [$cmd], 错误: ${e.message}")
+                val exit = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd)).waitFor()
+                logEvent(context, "Init command: [$cmd] exit=$exit")
+            } catch (t: Throwable) {
+                logEvent(context, "Init command failed: [$cmd] ${t.message}", Log.WARN)
             }
         }
     }
 
-    /**
-     * 5. 核心攻坚：动态注入小米 Greezer 的 mBroadcastTargetWhiteList
-     * 将所有 FCM 接收应用加入小米私有广播白名单，并在收到 FCM 时放行
-     */
-    private fun injectGreezerWhiteList(classLoader: ClassLoader) {
+    private fun registerMilletObserver(resolver: ContentResolver) {
         try {
-            val greezeClass = classLoader.loadClass("com.miui.server.greeze.GreezeManagerService")
-            for (field in greezeClass.declaredFields) {
-                if (field.name == "mBroadcastTargetWhiteList") {
-                    field.isAccessible = true
-                    val whiteList = field.get(null) as? MutableMap<String, MutableList<String>>
-                    if (whiteList != null) {
-                        val actions = mutableListOf(
-                            "com.google.android.c2dm.intent.RECEIVE",
-                            "com.google.android.c2dm.intent.REGISTRATION",
-                            "android.net.wifi.STATE_CHANGE",
-                            "android.net.conn.CONNECTIVITY_CHANGE"
-                        )
-                        whiteList["org.telegram.messenger"] = actions
-                        whiteList["com.nextcloud.talk2"] = actions
-                        whiteList["com.google.android.gms"] = actions
-                        log(Log.INFO, TAG, "成功向 GreezeManagerService.mBroadcastTargetWhiteList 注入 FCM 白名单！")
-                    }
+            ensureGmsInMillet(resolver)
+            val uri = Settings.System.getUriFor(SETTING_MILLET)
+            resolver.registerContentObserver(uri, false, object : ContentObserver(Handler(Looper.getMainLooper())) {
+                override fun onChange(selfChange: Boolean, uri: Uri?) {
+                    ensureGmsInMillet(resolver)
                 }
-            }
-        } catch (t: Throwable) {
-            log(Log.WARN, TAG, "注入 GreezeManagerService 白名单失败: ${t.message}")
+            })
+            log(Log.INFO, TAG, "MILLET observer registered")
+        } catch (e: Throwable) {
+            log(Log.WARN, TAG, "MILLET observer failed: ${e.message}")
         }
+    }
+
+    private fun ensureGmsInMillet(resolver: ContentResolver) {
+        try {
+            val current = Settings.System.getString(resolver, SETTING_MILLET) ?: ""
+            val list = current.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+            if (!list.contains(GMS_PKG)) {
+                list.add(GMS_PKG)
+                Settings.System.putString(resolver, SETTING_MILLET, list.joinToString(","))
+            }
+        } catch (e: Throwable) {
+            log(Log.WARN, TAG, "ensure MILLET failed: ${e.message}")
+        }
+    }
+
+    private fun extractTargetPackage(args: Array<out Any?>): String? {
+        for (arg in args) {
+            when (arg) {
+                is String -> if (arg.contains('.') && fcmPackages.contains(arg)) return arg
+                is Intent -> arg.component?.packageName?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun saveFcmPackages(context: Context, packages: Set<String>) {
+        try {
+            val appContext = context.createPackageContext(MODULE_PKG, Context.CONTEXT_IGNORE_SECURITY)
+            File(appContext.filesDir, "fcm_apps.txt").writeText(packages.sorted().joinToString("\n"))
+        } catch (_: Throwable) {}
     }
 }
